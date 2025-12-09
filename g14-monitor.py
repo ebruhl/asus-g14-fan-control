@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 import gi
 gi.require_version('Gtk', '3.0')
-gi.require_version('AppIndicator3', '0.1')
-from gi.repository import Gtk, AppIndicator3, GLib
+from gi.repository import Gtk, GLib
 import subprocess
 import re
 from datetime import datetime
@@ -12,23 +11,24 @@ DEBUG_LOG = os.path.expanduser("~/g14-debug.log")
 
 class G14Monitor:
     def __init__(self):
-        self.indicator = AppIndicator3.Indicator.new(
-            "g14-monitor",
-            "computer",
-            AppIndicator3.IndicatorCategory.HARDWARE
-        )
-        self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
-        
-        # Track fan speed for spin-up detection
-        self.last_fan_speed = None
+        # Use StatusIcon instead of AppIndicator for Cinnamon compatibility
+        self.status_icon = Gtk.StatusIcon()
+        self.status_icon.set_from_icon_name("computer")
+        self.status_icon.set_tooltip_text("G14 Monitor")
+        self.status_icon.connect("popup-menu", self.on_popup_menu)
+        self.status_icon.connect("activate", self.on_activate)
+
+        # Track PWM for spin-up detection
+        self.last_pwm_cpu = None
         self.last_logged_time = None
-        
+
         # Create menu
         self.menu = Gtk.Menu()
-        
+
         # Status items (now clickable)
         self.temp_item = Gtk.MenuItem(label="Temp: --°C")
-        self.fan_item = Gtk.MenuItem(label="Fan: ---- RPM")
+        self.pwm_cpu_item = Gtk.MenuItem(label="CPU PWM: ---")
+        self.pwm_gpu_item = Gtk.MenuItem(label="GPU PWM: ---")
         self.power_item = Gtk.MenuItem(label="Power: -- W")
         self.gpu_item = Gtk.MenuItem(label="GPU: ---")
         self.policy_item = Gtk.MenuItem(label="Policy: ---")
@@ -38,23 +38,32 @@ class G14Monitor:
         self.policy_item.connect("activate", self.cycle_policy)
         
         self.menu.append(self.temp_item)
-        self.menu.append(self.fan_item)
+        self.menu.append(self.pwm_cpu_item)
+        self.menu.append(self.pwm_gpu_item)
         self.menu.append(self.power_item)
         self.menu.append(self.gpu_item)
         self.menu.append(self.policy_item)
         
         # Separator
         self.menu.append(Gtk.SeparatorMenuItem())
-        
+
+        # State capture button (prominent)
+        capture_item = Gtk.MenuItem(label="📸 CAPTURE CURRENT STATE")
+        capture_item.connect("activate", self.capture_state)
+        self.menu.append(capture_item)
+
+        # Separator
+        self.menu.append(Gtk.SeparatorMenuItem())
+
         # Monitoring and debug options
         monitor_item = Gtk.MenuItem(label="📊 Open Live Monitor")
         monitor_item.connect("activate", self.open_live_monitor)
         self.menu.append(monitor_item)
-        
+
         view_log_item = Gtk.MenuItem(label="📋 View Debug Log")
         view_log_item.connect("activate", self.view_debug_log)
         self.menu.append(view_log_item)
-        
+
         clear_log_item = Gtk.MenuItem(label="🗑️  Clear Debug Log")
         clear_log_item.connect("activate", self.clear_debug_log)
         self.menu.append(clear_log_item)
@@ -80,7 +89,6 @@ class G14Monitor:
         self.menu.append(quit_item)
         
         self.menu.show_all()
-        self.indicator.set_menu(self.menu)
         
         # Initialize debug log
         self.init_debug_log()
@@ -88,6 +96,14 @@ class G14Monitor:
         # Update every 2 seconds
         GLib.timeout_add_seconds(2, self.update_status)
         self.update_status()
+
+    def on_activate(self, icon):
+        """Show menu when status icon is left-clicked"""
+        self.menu.popup(None, None, None, None, 0, Gtk.get_current_event_time())
+
+    def on_popup_menu(self, icon, button, time):
+        """Show menu when status icon is right-clicked"""
+        self.menu.popup(None, None, None, None, button, time)
     
     def init_debug_log(self):
         """Initialize debug log file"""
@@ -105,23 +121,26 @@ class G14Monitor:
                 f.write(f"  {key}: {value}\n")
             f.write("\n")
     
-    def detect_fan_spinup(self, current_fan_speed):
-        """Detect and log significant fan speed increases"""
-        if self.last_fan_speed is None:
-            self.last_fan_speed = current_fan_speed
+    def detect_pwm_change(self, current_pwm):
+        """Detect and log significant PWM increases"""
+        if current_pwm is None:
             return
-        
-        # Detect spin-up (increase of 500+ RPM)
-        if current_fan_speed - self.last_fan_speed >= 500:
+
+        if self.last_pwm_cpu is None:
+            self.last_pwm_cpu = current_pwm
+            return
+
+        # Detect spin-up (increase of 30+ PWM, roughly 12%)
+        if current_pwm - self.last_pwm_cpu >= 30:
             # Don't log too frequently (at most every 30 seconds)
             now = datetime.now()
             if self.last_logged_time is None or (now - self.last_logged_time).seconds >= 30:
-                self.log_fan_event("FAN SPIN-UP DETECTED", current_fan_speed)
+                self.log_fan_event("FAN SPIN-UP DETECTED", current_pwm)
                 self.last_logged_time = now
-        
-        self.last_fan_speed = current_fan_speed
+
+        self.last_pwm_cpu = current_pwm
     
-    def log_fan_event(self, event_type, fan_speed):
+    def log_fan_event(self, event_type, pwm_value):
         """Log detailed system state during fan event"""
         temp = self.get_temp()
         power = self.get_power_draw()
@@ -130,13 +149,16 @@ class G14Monitor:
         policy = self.get_policy()
         platform = self.get_platform_profile()
         boost = self.get_cpu_boost()
-        
+        pwm_cpu = self.get_pwm_cpu()
+        pwm_gpu = self.get_pwm_gpu()
+
         # Get top CPU processes
         top_procs = self.get_top_processes()
-        
+
         details = {
             "Event": event_type,
-            "Fan Speed": f"{fan_speed} RPM",
+            "CPU PWM": f"{pwm_cpu}/255 ({pwm_cpu*100//255}%)" if pwm_cpu is not None else "N/A",
+            "GPU PWM": f"{pwm_gpu}/255 ({pwm_gpu*100//255}%)" if pwm_gpu is not None else "N/A",
             "CPU Temp": f"{temp}°C" if temp else "N/A",
             "Power Draw": f"{power:.1f}W" if power else "N/A",
             "GPU Status": gpu_status,
@@ -146,7 +168,7 @@ class G14Monitor:
             "CPU Boost": "Enabled" if boost else "Disabled",
             "Top Processes": top_procs
         }
-        
+
         self.log_debug(event_type, details)
     
     def get_power_draw(self):
@@ -223,8 +245,30 @@ while true; do
     echo ""
     
     echo "--- Current Status ---"
-    echo "Temperature: $(sensors | grep 'Tctl:' | awk '{print $2}')"
-    echo "Fan Speed:   $(sensors | grep 'cpu_fan:' | awk '{print $2, $3}')"
+    TEMP_RAW=$(sensors | grep 'Tctl:' | awk '{print $2}' | sed 's/+//;s/°C//')
+    echo "Temperature: +${TEMP_RAW}°C"
+
+    # Show actual PWM values from fan curves
+    if [ -n "$TEMP_RAW" ]; then
+        # Read reference curve point to show curve is active
+        PWM1_P2=$(cat /sys/class/hwmon/hwmon7/pwm1_auto_point2_pwm 2>/dev/null)
+        PWM2_P2=$(cat /sys/class/hwmon/hwmon7/pwm2_auto_point2_pwm 2>/dev/null)
+        if [ -n "$PWM1_P2" ]; then
+            PWM_CPU_PCT=$((PWM1_P2 * 100 / 255))
+            echo "CPU PWM:     ${PWM1_P2}/255 (${PWM_CPU_PCT}%) [curve point 2]"
+        else
+            echo "CPU PWM:     N/A"
+        fi
+        if [ -n "$PWM2_P2" ]; then
+            PWM_GPU_PCT=$((PWM2_P2 * 100 / 255))
+            echo "GPU PWM:     ${PWM2_P2}/255 (${PWM_GPU_PCT}%) [curve point 2]"
+        else
+            echo "GPU PWM:     N/A"
+        fi
+    else
+        echo "CPU PWM:     N/A"
+        echo "GPU PWM:     N/A"
+    fi
     POWER_UW=$(cat /sys/class/power_supply/BAT0/power_now 2>/dev/null)
     if [ -n "$POWER_UW" ]; then
         POWER_W=$(echo "scale=2; $POWER_UW / 1000000" | bc)
@@ -270,6 +314,91 @@ done
         with open(DEBUG_LOG, 'w') as f:
             f.write(f"Debug log cleared: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         self.show_notification("Debug Log", "Debug log cleared")
+
+    def capture_state(self, widget):
+        """Capture complete system state to a file"""
+        timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        filename = os.path.expanduser(f"~/g14-state-capture-{timestamp}.txt")
+
+        with open(filename, 'w') as f:
+            f.write("="*80 + "\n")
+            f.write(f"G14 STATE CAPTURE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("="*80 + "\n\n")
+
+            # Current readings
+            temp = self.get_temp()
+            pwm_cpu = self.get_pwm_cpu()
+            pwm_gpu = self.get_pwm_gpu()
+            power = self.get_power_draw()
+            gpu_status = self.get_gpu_status()
+            gpu_control = self.get_gpu_control()
+            policy = self.get_policy()
+            platform = self.get_platform_profile()
+            boost = self.get_cpu_boost()
+
+            f.write("CURRENT STATUS:\n")
+            f.write(f"  CPU Temp: {temp:.1f}°C\n" if temp else "  CPU Temp: N/A\n")
+            f.write(f"  CPU PWM: {pwm_cpu}/255 ({pwm_cpu*100//255}%)\n" if pwm_cpu else "  CPU PWM: N/A\n")
+            f.write(f"  GPU PWM: {pwm_gpu}/255 ({pwm_gpu*100//255}%)\n" if pwm_gpu else "  GPU PWM: N/A\n")
+            f.write(f"  Power Draw: {power:.1f}W\n" if power else "  Power Draw: N/A\n")
+            f.write(f"  GPU Status: {gpu_status}\n")
+            f.write(f"  GPU Control: {gpu_control}\n")
+            f.write(f"  Throttle Policy: {policy}\n")
+            f.write(f"  Platform Profile: {platform}\n")
+            f.write(f"  CPU Boost: {'Enabled' if boost else 'Disabled'}\n")
+            f.write("\n")
+
+            # CPU Fan Curve
+            f.write("CPU FAN CURVE (pwm1):\n")
+            try:
+                for i in range(1, 9):
+                    temp_path = f'/sys/class/hwmon/hwmon7/pwm1_auto_point{i}_temp'
+                    pwm_path = f'/sys/class/hwmon/hwmon7/pwm1_auto_point{i}_pwm'
+                    with open(temp_path, 'r') as tf:
+                        curve_temp = int(tf.read().strip())
+                    with open(pwm_path, 'r') as pf:
+                        curve_pwm = int(pf.read().strip())
+                    f.write(f"  Point {i}: {curve_temp}°C = PWM {curve_pwm}\n")
+            except Exception as e:
+                f.write(f"  Error reading curve: {e}\n")
+            f.write("\n")
+
+            # GPU Fan Curve
+            f.write("GPU FAN CURVE (pwm2):\n")
+            try:
+                for i in range(1, 9):
+                    temp_path = f'/sys/class/hwmon/hwmon7/pwm2_auto_point{i}_temp'
+                    pwm_path = f'/sys/class/hwmon/hwmon7/pwm2_auto_point{i}_pwm'
+                    with open(temp_path, 'r') as tf:
+                        curve_temp = int(tf.read().strip())
+                    with open(pwm_path, 'r') as pf:
+                        curve_pwm = int(pf.read().strip())
+                    f.write(f"  Point {i}: {curve_temp}°C = PWM {curve_pwm}\n")
+            except Exception as e:
+                f.write(f"  Error reading curve: {e}\n")
+            f.write("\n")
+
+            # Top processes
+            f.write("TOP CPU PROCESSES:\n")
+            top_procs = self.get_top_processes()
+            f.write(f"  {top_procs}\n")
+            f.write("\n")
+
+            # Full sensors output
+            f.write("FULL SENSORS OUTPUT:\n")
+            try:
+                result = subprocess.run(['sensors'], capture_output=True, text=True)
+                f.write(result.stdout)
+            except Exception as e:
+                f.write(f"  Error: {e}\n")
+            f.write("\n")
+
+            f.write("="*80 + "\n")
+            f.write("State capture complete. Share this file for analysis.\n")
+            f.write("="*80 + "\n")
+
+        self.show_notification("State Captured", f"Saved to:\n{filename}")
+        self.log_debug("USER ACTION", {"Action": f"Captured state to {filename}"})
     
     def run_command(self, cmd):
         """Run shell command with sudo"""
@@ -345,6 +474,79 @@ done
         except:
             pass
         return None
+
+    def get_pwm_cpu(self):
+        """Calculate current CPU fan PWM value based on temp and curve (0-255)"""
+        try:
+            temp = self.get_temp()
+            if temp is None:
+                return None
+
+            # Read fan curve points
+            curve = []
+            for i in range(1, 9):
+                temp_path = f'/sys/class/hwmon/hwmon7/pwm1_auto_point{i}_temp'
+                pwm_path = f'/sys/class/hwmon/hwmon7/pwm1_auto_point{i}_pwm'
+                with open(temp_path, 'r') as f:
+                    curve_temp = float(f.read().strip())  # Already in degrees C
+                with open(pwm_path, 'r') as f:
+                    curve_pwm = int(f.read().strip())
+                curve.append((curve_temp, curve_pwm))
+
+            # Find current PWM by interpolation
+            if temp <= curve[0][0]:
+                return curve[0][1]
+            if temp >= curve[-1][0]:
+                return curve[-1][1]
+
+            for i in range(len(curve) - 1):
+                if curve[i][0] <= temp <= curve[i+1][0]:
+                    # Linear interpolation
+                    t1, pwm1 = curve[i]
+                    t2, pwm2 = curve[i+1]
+                    pwm = pwm1 + (pwm2 - pwm1) * (temp - t1) / (t2 - t1)
+                    return int(pwm)
+
+            return None
+        except:
+            return None
+
+    def get_pwm_gpu(self):
+        """Calculate current GPU fan PWM value based on temp and curve (0-255)"""
+        try:
+            # GPU temp from sensors (if available)
+            temp = self.get_temp()  # Using CPU temp as proxy since GPU is suspended
+            if temp is None:
+                return None
+
+            # Read fan curve points
+            curve = []
+            for i in range(1, 9):
+                temp_path = f'/sys/class/hwmon/hwmon7/pwm2_auto_point{i}_temp'
+                pwm_path = f'/sys/class/hwmon/hwmon7/pwm2_auto_point{i}_pwm'
+                with open(temp_path, 'r') as f:
+                    curve_temp = float(f.read().strip())  # Already in degrees C
+                with open(pwm_path, 'r') as f:
+                    curve_pwm = int(f.read().strip())
+                curve.append((curve_temp, curve_pwm))
+
+            # Find current PWM by interpolation
+            if temp <= curve[0][0]:
+                return curve[0][1]
+            if temp >= curve[-1][0]:
+                return curve[-1][1]
+
+            for i in range(len(curve) - 1):
+                if curve[i][0] <= temp <= curve[i+1][0]:
+                    # Linear interpolation
+                    t1, pwm1 = curve[i]
+                    t2, pwm2 = curve[i+1]
+                    pwm = pwm1 + (pwm2 - pwm1) * (temp - t1) / (t2 - t1)
+                    return int(pwm)
+
+            return None
+        except:
+            return None
     
     def get_gpu_status(self):
         try:
@@ -382,46 +584,56 @@ done
     
     def update_status(self):
         temp = self.get_temp()
-        fan = self.get_fan_speed()
         power = self.get_power_draw()
         gpu = self.get_gpu_status()
         policy = self.get_policy()
-        
-        # Detect fan spin-ups
-        if fan is not None:
-            self.detect_fan_spinup(fan)
-        
+        pwm_cpu = self.get_pwm_cpu()
+        pwm_gpu = self.get_pwm_gpu()
+
+        # Detect PWM changes (fan spin-ups)
+        self.detect_pwm_change(pwm_cpu)
+
         # Update indicator label
         temp_icon = self.get_temp_icon(temp)
         if temp is not None:
             temp_str = f"{temp:.0f}°C"
         else:
             temp_str = "--°C"
-        
+
         gpu_icon = "⚡" if gpu == "active" else "💤"
-        
-        # Main indicator text
-        self.indicator.set_label(f"{temp_icon}{temp_str}", "")
-        
+
+        # Update status icon tooltip
+        tooltip_text = f"G14 Monitor\n{temp_icon} {temp_str}"
+        if pwm_cpu is not None:
+            tooltip_text += f"\nCPU PWM: {pwm_cpu}/255"
+        self.status_icon.set_tooltip_text(tooltip_text)
+
         # Update menu items with click hints
         if temp is not None:
             self.temp_item.set_label(f"Temp: {temp:.1f}°C {temp_icon}")
         else:
             self.temp_item.set_label("Temp: --°C")
-        
-        if fan is not None:
-            self.fan_item.set_label(f"Fan: {fan} RPM")
+
+        if pwm_cpu is not None:
+            pwm_cpu_percent = pwm_cpu * 100 // 255
+            self.pwm_cpu_item.set_label(f"CPU PWM: {pwm_cpu}/255 ({pwm_cpu_percent}%)")
         else:
-            self.fan_item.set_label("Fan: ---- RPM")
-        
+            self.pwm_cpu_item.set_label("CPU PWM: ---")
+
+        if pwm_gpu is not None:
+            pwm_gpu_percent = pwm_gpu * 100 // 255
+            self.pwm_gpu_item.set_label(f"GPU PWM: {pwm_gpu}/255 ({pwm_gpu_percent}%)")
+        else:
+            self.pwm_gpu_item.set_label("GPU PWM: ---")
+
         if power is not None:
             self.power_item.set_label(f"Power: {power:.1f}W")
         else:
             self.power_item.set_label("Power: -- W")
-        
+
         self.gpu_item.set_label(f"GPU: {gpu} {gpu_icon} (click to force sleep)")
         self.policy_item.set_label(f"Policy: {policy} (click to cycle)")
-        
+
         return True
     
     def quit(self, widget):
